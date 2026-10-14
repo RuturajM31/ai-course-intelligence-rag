@@ -1,10 +1,10 @@
-streamlit
-langchain
+streamlit==1.65.0
 langchain-core
-langchain-community
 langchain-text-splitters
-langchain-ollama
 langchain-chroma
+langchain-huggingface==1.2.3
 chromadb
 pypdf
-pandas
+sentence-transformers==6.1.0
+transformers==5.19.0
+accelerate

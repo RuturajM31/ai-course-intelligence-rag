@@ -1,21 +1,37 @@
 # ============================================================
-# DAY 6 PROJECT 3
 # AI COURSE INTELLIGENCE
-# Multi-Document RAG Chatbot
+# Free Cloud Multi-Document RAG Chatbot
 # Developed by Ruturaj Mokashi
 # ============================================================
 
-
-# ============================================================
-# 1. IMPORTS
-# ============================================================
+import hashlib
+import io
+import logging
+import uuid
 
 import streamlit as st
-from pathlib import Path
+import torch
 
+from pypdf import PdfReader
+
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
+
+from langchain_core.documents import Document
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+
+# ============================================================
+# 1. LOGGING
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -23,32 +39,39 @@ from langchain_core.prompts import ChatPromptTemplate
 # ============================================================
 
 st.set_page_config(
-    page_title="Know Your Artificial Intelligence",
+    page_title="AI Course Intelligence",
     page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
-# 3. PROJECT SETTINGS
+# 3. RAG SETTINGS
+# Cloud adaptation of evaluated Configuration B
 # ============================================================
 
-DOCUMENT_COUNT = 5
-PAGE_COUNT = 1031
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+RETRIEVAL_K = 4
 
-PERSIST_DIRECTORY = (
-    r"C:\Ruturaj\Projects\AI Applications"
-    r"\Dozenten_Uploads-20261006"
-    r"\KI__Woche_2__Lerntag_6"
-    r"\chroma_day6"
+MAX_PDFS = 5
+MAX_TOTAL_UPLOAD_MB = 50
+
+EMBEDDING_MODEL = (
+    "sentence-transformers/all-MiniLM-L6-v2"
 )
 
-COLLECTION_NAME = "day6_course_chatbot"
+LLM_MODEL = (
+    "Qwen/Qwen2.5-0.5B-Instruct"
+)
+
+MAX_INPUT_TOKENS = 4096
+MAX_NEW_TOKENS = 250
 
 
 # ============================================================
-# 4. PROFESSIONAL CSS
+# 4. CSS
 # ============================================================
 
 st.markdown(
@@ -61,14 +84,10 @@ st.markdown(
     padding-bottom: 4rem;
 }
 
-
-/* Sidebar */
 [data-testid="stSidebar"] {
     border-right: 1px solid rgba(150,150,160,0.15);
 }
 
-
-/* Metrics */
 [data-testid="stMetric"] {
     border: 1px solid rgba(130,130,150,0.18);
     border-radius: 14px;
@@ -76,166 +95,341 @@ st.markdown(
     background: rgba(255,255,255,0.025);
 }
 
-
-/* Buttons */
 .stButton > button {
     min-height: 48px;
     border-radius: 12px;
     font-weight: 600;
 }
 
-
-/* Chat messages */
 [data-testid="stChatMessage"] {
     border-radius: 14px;
 }
 
-
-/* Tabs */
 button[data-baseweb="tab"] {
     font-weight: 600;
 }
 
-
-/* Main title */
 h1 {
     letter-spacing: -0.8px;
 }
 
 </style>
 """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# 5. LOAD EMBEDDING MODEL
+# 5. SESSION STATE
+# ============================================================
+
+DEFAULT_STATE = {
+    "messages": [],
+    "vectorstore": None,
+    "document_count": 0,
+    "page_count": 0,
+    "chunk_count": 0,
+    "last_upload_signature": None,
+    "knowledge_base_ready": False,
+}
+
+
+for key, value in DEFAULT_STATE.items():
+
+    if key not in st.session_state:
+
+        st.session_state[key] = value
+
+
+# ============================================================
+# 6. LOAD EMBEDDING MODEL
 # ============================================================
 
 @st.cache_resource
 def load_embeddings():
 
-    return OllamaEmbeddings(
-        model="all-minilm:33m",
-        base_url="http://127.0.0.1:11434"
+    # Small CPU-friendly embedding model.
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={
+            "device": "cpu",
+        },
+        encode_kwargs={
+            "normalize_embeddings": True,
+        },
     )
 
 
-embeddings = load_embeddings()
-
-
 # ============================================================
-# 6. LOAD PERSISTENT CHROMA DATABASE
+# 7. LOAD LOCAL LANGUAGE MODEL
 # ============================================================
 
 @st.cache_resource
-def load_vectorstore():
+def load_local_llm():
 
-    return Chroma(
-        collection_name=COLLECTION_NAME,
+    # Load tokenizer from Hugging Face.
+    tokenizer = AutoTokenizer.from_pretrained(
+        LLM_MODEL,
+    )
+
+    # Load the small Qwen model locally.
+    #
+    # torch_dtype="auto" preserves the model's compact
+    # stored datatype instead of forcing float32.
+    #
+    # device_map="auto" uses CPU on Streamlit Cloud.
+    model = AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL,
+        torch_dtype="auto",
+        device_map="auto",
+    )
+
+    # Inference mode only.
+    model.eval()
+
+    return tokenizer, model
+
+
+# ============================================================
+# 8. TEXT SPLITTER
+# ============================================================
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    add_start_index=True,
+)
+
+
+# ============================================================
+# 9. CREATE UPLOAD SIGNATURE
+# ============================================================
+
+def create_upload_signature(uploaded_files):
+
+    if not uploaded_files:
+
+        return None
+
+    hasher = hashlib.sha256()
+
+    # Sort filenames so ordering does not affect signature.
+    for uploaded_file in sorted(
+        uploaded_files,
+        key=lambda file: file.name,
+    ):
+
+        file_bytes = uploaded_file.getvalue()
+
+        hasher.update(
+            uploaded_file.name.encode("utf-8")
+        )
+
+        hasher.update(file_bytes)
+
+    return hasher.hexdigest()
+
+
+# ============================================================
+# 10. DELETE OLD VECTORSTORE
+# ============================================================
+
+def delete_existing_vectorstore():
+
+    vectorstore = st.session_state.vectorstore
+
+    if vectorstore is not None:
+
+        try:
+
+            vectorstore.delete_collection()
+
+        except Exception:
+
+            logger.exception(
+                "Could not delete old Chroma collection."
+            )
+
+    st.session_state.vectorstore = None
+
+    st.session_state.document_count = 0
+
+    st.session_state.page_count = 0
+
+    st.session_state.chunk_count = 0
+
+    st.session_state.knowledge_base_ready = False
+
+    st.session_state.messages = []
+
+
+# ============================================================
+# 11. LOAD PDF DOCUMENTS
+# ============================================================
+
+def load_pdf_documents(uploaded_files):
+
+    documents = []
+
+    readable_pages = 0
+
+    for uploaded_file in uploaded_files:
+
+        try:
+
+            file_bytes = uploaded_file.getvalue()
+
+            reader = PdfReader(
+                io.BytesIO(file_bytes)
+            )
+
+            for page_number, page in enumerate(
+                reader.pages
+            ):
+
+                # Extract text from one PDF page.
+                text = page.extract_text()
+
+                # Ignore pages without readable text.
+                if not text:
+
+                    continue
+
+                if not text.strip():
+
+                    continue
+
+                document = Document(
+                    page_content=text,
+                    metadata={
+                        "source": uploaded_file.name,
+                        "page": page_number,
+                    },
+                )
+
+                documents.append(document)
+
+                readable_pages += 1
+
+        except Exception as error:
+
+            logger.exception(
+                "PDF processing failed for %s",
+                uploaded_file.name,
+            )
+
+            raise ValueError(
+                f"Could not read "
+                f"'{uploaded_file.name}'."
+            ) from error
+
+    return documents, readable_pages
+
+
+# ============================================================
+# 12. BUILD VECTORSTORE
+# ============================================================
+
+def build_vectorstore(uploaded_files):
+
+    # Load PDF pages.
+    documents, page_count = (
+        load_pdf_documents(uploaded_files)
+    )
+
+    if not documents:
+
+        raise ValueError(
+            "No readable text was found "
+            "inside the uploaded PDFs."
+        )
+
+    # Split pages into Configuration-B chunks.
+    splits = text_splitter.split_documents(
+        documents
+    )
+
+    if not splits:
+
+        raise ValueError(
+            "No text chunks could be created."
+        )
+
+    # Load embeddings only when we actually build the KB.
+    embeddings = load_embeddings()
+
+    # Every build receives a new Chroma collection.
+    collection_name = (
+        "rag_" + uuid.uuid4().hex
+    )
+
+    vectorstore = Chroma(
+        collection_name=collection_name,
         embedding_function=embeddings,
-        persist_directory=PERSIST_DIRECTORY
+    )
+
+    # Smaller batches reduce memory spikes.
+    batch_size = 32
+
+    total_chunks = len(splits)
+
+    progress_bar = st.progress(
+        0,
+        text="Creating document embeddings...",
+    )
+
+    for start in range(
+        0,
+        total_chunks,
+        batch_size,
+    ):
+
+        batch = splits[
+            start:start + batch_size
+        ]
+
+        vectorstore.add_documents(
+            batch
+        )
+
+        processed = min(
+            start + batch_size,
+            total_chunks,
+        )
+
+        progress = (
+            processed / total_chunks
+        )
+
+        progress_bar.progress(
+            progress,
+            text=(
+                f"Indexing "
+                f"{processed:,} / "
+                f"{total_chunks:,} chunks"
+            ),
+        )
+
+    progress_bar.empty()
+
+    return (
+        vectorstore,
+        page_count,
+        total_chunks,
     )
 
 
-vectorstore = load_vectorstore()
-
-
-# Read the real number of indexed chunks.
-chunk_count = vectorstore._collection.count()
-
-
 # ============================================================
-# 7. CREATE RETRIEVER
-# ============================================================
-
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={
-        "k": 4
-    }
-)
-
-
-# ============================================================
-# 8. LOAD LOCAL LLM
-# ============================================================
-
-@st.cache_resource
-def load_llm():
-
-    return OllamaLLM(
-        model="llama3.2:3b",
-        base_url="http://127.0.0.1:11434",
-        temperature=0
-    )
-
-
-llm = load_llm()
-
-
-# ============================================================
-# 9. GROUNDED RAG PROMPT
-# ============================================================
-
-prompt = ChatPromptTemplate.from_template(
-    """
-You are an AI course material assistant.
-
-Answer the user's question using ONLY the retrieved course material.
-
-Follow these rules:
-
-1. Use only information contained in the provided context.
-
-2. Do not invent facts.
-
-3. Explain the answer clearly and in simple language.
-
-4. Use short paragraphs or bullet points when useful.
-
-5. Do NOT write filenames.
-
-6. Do NOT write page numbers.
-
-7. Do NOT generate citations yourself.
-
-8. The application will display the retrieved sources separately.
-
-If the answer is not available in the context, say exactly:
-
-"The answer is not available in the provided course materials."
-
-
-Context:
-
-{context}
-
-
-Question:
-
-{question}
-
-
-Answer:
-"""
-)
-
-
-# ============================================================
-# 10. FORMAT RETRIEVED DOCUMENTS
+# 13. FORMAT RETRIEVED CONTEXT
 # ============================================================
 
 def format_docs(docs):
-    """
-    Clean PDF text before sending it to the LLM.
-    """
 
     chunks = []
 
     for doc in docs:
 
-        # Remove unusual PDF spaces and line breaks.
+        # Remove unnecessary PDF whitespace.
         clean_text = " ".join(
             doc.page_content.split()
         )
@@ -246,27 +440,26 @@ def format_docs(docs):
 
 
 # ============================================================
-# 11. GET RELIABLE SOURCES FROM METADATA
+# 14. GET REAL SOURCE METADATA
 # ============================================================
 
 def get_retrieved_sources(docs):
-    """
-    Source names and page numbers come directly
-    from Chroma metadata, not from the LLM.
-    """
 
     sources = []
 
     for doc in docs:
 
-        # Real PDF filename.
-        filename = Path(
-            doc.metadata["source"]
-        ).name
+        filename = doc.metadata.get(
+            "source",
+            "Unknown document",
+        )
 
-        # LangChain stores page numbers starting from 0.
+        # PDF metadata uses zero-based page indexing.
         page = (
-            doc.metadata.get("page", 0)
+            doc.metadata.get(
+                "page",
+                0,
+            )
             + 1
         )
 
@@ -274,29 +467,133 @@ def get_retrieved_sources(docs):
             f"{filename} — Page {page}"
         )
 
-        # Avoid duplicate citations.
+        # Avoid duplicate source labels.
         if citation not in sources:
+
             sources.append(citation)
 
     return sources
 
 
 # ============================================================
-# 12. INITIALIZE CHAT HISTORY
+# 15. GENERATE ANSWER LOCALLY
 # ============================================================
 
-if "messages" not in st.session_state:
+def generate_answer(
+    question,
+    context,
+):
 
-    st.session_state.messages = []
+    # Model is loaded only when the first question is asked.
+    tokenizer, model = load_local_llm()
+
+    system_prompt = """
+You are a document question-answering assistant.
+
+Follow these rules strictly:
+
+1. Answer ONLY using information in the supplied context.
+2. Do not use outside knowledge.
+3. Do not invent facts.
+4. Give a clear and simple answer.
+5. Prefer short paragraphs or bullet points.
+6. Do NOT include filenames.
+7. Do NOT include page numbers.
+8. Do NOT create citations.
+
+If the context does not clearly contain the answer,
+respond exactly with:
+
+"The answer is not available in the provided course materials."
+"""
+
+    user_prompt = f"""
+CONTEXT:
+
+{context}
+
+QUESTION:
+
+{question}
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
+
+    # Qwen's own chat template formats system/user messages.
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # Convert prompt into model tokens.
+    model_inputs = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_INPUT_TOKENS,
+    )
+
+    # Put tensors on the same device as the model.
+    model_inputs = {
+        key: value.to(model.device)
+        for key, value in model_inputs.items()
+    }
+
+    input_length = (
+        model_inputs["input_ids"].shape[-1]
+    )
+
+    # No gradients are required for inference.
+    with torch.inference_mode():
+
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    # Remove the original prompt tokens.
+    answer_tokens = generated_ids[
+        0,
+        input_length:
+    ]
+
+    # Convert generated tokens back into text.
+    answer = tokenizer.decode(
+        answer_tokens,
+        skip_special_tokens=True,
+    ).strip()
+
+    if not answer:
+
+        raise RuntimeError(
+            "The local model returned "
+            "an empty response."
+        )
+
+    return answer
 
 
 # ============================================================
-# 13. SIDEBAR
+# 16. SIDEBAR
 # ============================================================
 
 with st.sidebar:
 
-    st.title("🧠 AI Course Intelligence")
+    st.title(
+        "🧠 AI Course Intelligence"
+    )
 
     st.caption(
         "Developed by **Ruturaj Mokashi**"
@@ -304,76 +601,216 @@ with st.sidebar:
 
     st.divider()
 
-
-    # --------------------------------------------------------
-    # ABOUT
-    # --------------------------------------------------------
-
     st.subheader("About")
 
     st.write(
-        "A local Retrieval-Augmented Generation assistant "
-        "that searches multiple AI course documents before "
-        "generating an answer."
+        "Upload PDF documents and explore them "
+        "using Retrieval-Augmented Generation."
     )
 
-
     st.divider()
-
 
     # --------------------------------------------------------
     # KNOWLEDGE BASE
     # --------------------------------------------------------
 
-    st.subheader("Knowledge Base")
-
-    st.write(
-        f"📚 **{DOCUMENT_COUNT} PDF documents**"
+    st.subheader(
+        "📄 Knowledge Base"
     )
 
-    st.write(
-        f"📄 **{PAGE_COUNT:,} pages**"
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help=(
+            "Upload up to 5 PDFs. "
+            "Maximum combined size: 50 MB."
+        ),
     )
 
-    st.write(
-        f"🧩 **{chunk_count:,} searchable chunks**"
+    # Maximum of 5 PDFs.
+    too_many_files = (
+        uploaded_files
+        and len(uploaded_files) > MAX_PDFS
     )
 
-    st.write(
-        "🔎 **Top 4 semantic retrieval**"
+    if too_many_files:
+
+        st.error(
+            f"Please upload no more than "
+            f"{MAX_PDFS} PDFs."
+        )
+
+    # Calculate total size.
+    total_upload_bytes = sum(
+        len(file.getvalue())
+        for file in uploaded_files
     )
 
+    total_upload_mb = (
+        total_upload_bytes
+        / (1024 * 1024)
+    )
+
+    upload_too_large = (
+        total_upload_mb
+        > MAX_TOTAL_UPLOAD_MB
+    )
+
+    if upload_too_large:
+
+        st.error(
+            f"Combined upload size must be "
+            f"below {MAX_TOTAL_UPLOAD_MB} MB."
+        )
+
+    if uploaded_files:
+
+        st.caption(
+            f"{len(uploaded_files)} PDF(s) • "
+            f"{total_upload_mb:.1f} MB total"
+        )
+
+    # Detect whether uploaded files changed.
+    current_signature = (
+        create_upload_signature(
+            uploaded_files
+        )
+    )
+
+    if (
+        current_signature
+        != st.session_state.last_upload_signature
+    ):
+
+        delete_existing_vectorstore()
+
+        st.session_state.last_upload_signature = (
+            current_signature
+        )
+
+    build_disabled = (
+        not uploaded_files
+        or too_many_files
+        or upload_too_large
+    )
+
+    if st.button(
+        "⚙️ Build Knowledge Base",
+        type="primary",
+        use_container_width=True,
+        disabled=build_disabled,
+    ):
+
+        with st.spinner(
+            "Reading and preparing PDFs..."
+        ):
+
+            try:
+
+                delete_existing_vectorstore()
+
+                (
+                    vectorstore,
+                    page_count,
+                    chunk_count,
+                ) = build_vectorstore(
+                    uploaded_files
+                )
+
+                st.session_state.vectorstore = (
+                    vectorstore
+                )
+
+                st.session_state.document_count = (
+                    len(uploaded_files)
+                )
+
+                st.session_state.page_count = (
+                    page_count
+                )
+
+                st.session_state.chunk_count = (
+                    chunk_count
+                )
+
+                st.session_state.knowledge_base_ready = (
+                    True
+                )
+
+                st.success(
+                    "Knowledge base ready."
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Knowledge-base creation failed."
+                )
+
+                st.error(
+                    "The PDFs could not be processed. "
+                    "Please check the files and try again."
+                )
 
     st.divider()
 
+    # --------------------------------------------------------
+    # SESSION STATS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Current Session"
+    )
+
+    st.write(
+        f"📚 **"
+        f"{st.session_state.document_count}"
+        f" documents**"
+    )
+
+    st.write(
+        f"📄 **"
+        f"{st.session_state.page_count:,}"
+        f" pages**"
+    )
+
+    st.write(
+        f"🧩 **"
+        f"{st.session_state.chunk_count:,}"
+        f" chunks**"
+    )
+
+    st.write(
+        f"🔎 **Top "
+        f"{RETRIEVAL_K} retrieval**"
+    )
+
+    st.divider()
 
     # --------------------------------------------------------
     # AI STACK
     # --------------------------------------------------------
 
-    st.subheader("AI Stack")
-
+    st.subheader(
+        "AI Stack"
+    )
 
     st.caption("Language Model")
 
     st.code(
-        "Llama 3.2:3b"
+        "Qwen2.5-0.5B-Instruct"
     )
 
-
-    st.caption("Embedding Model")
+    st.caption("Embeddings")
 
     st.code(
-        "all-minilm:33m"
+        "all-MiniLM-L6-v2"
     )
-
 
     st.caption("Vector Database")
 
-    st.code(
-        "Chroma"
-    )
-
+    st.code("Chroma")
 
     st.caption("Framework")
 
@@ -381,24 +818,28 @@ with st.sidebar:
         "LangChain + Streamlit"
     )
 
-
-    st.caption("Processing")
-
-    st.code(
-        "100% Local"
+    st.caption(
+        "RAG Configuration"
     )
 
+    st.code(
+        "chunk=800 | overlap=100 | k=4"
+    )
+
+    st.caption(
+        "☁️ 100% local inference — no paid API"
+    )
+
+    st.caption(
+        "First answer may take longer "
+        "while the language model loads."
+    )
 
     st.divider()
 
-
-    # --------------------------------------------------------
-    # CLEAR CHAT
-    # --------------------------------------------------------
-
     if st.button(
         "🗑️ Clear Conversation",
-        use_container_width=True
+        use_container_width=True,
     ):
 
         st.session_state.messages = []
@@ -407,7 +848,7 @@ with st.sidebar:
 
 
 # ============================================================
-# 14. MAIN HEADER
+# 17. MAIN HEADER
 # ============================================================
 
 with st.container(
@@ -422,60 +863,76 @@ with st.container(
         """
 ### Multi-Document RAG Assistant
 
-Explore **Large Language Models, Prompt Engineering, Hugging Face,
-AI Agents and Agentic Design Patterns** across multiple course documents.
+Upload PDF documents and explore them using
+**Retrieval-Augmented Generation**.
 
-Ask questions and receive answers grounded in retrieved course material.
+The assistant retrieves relevant document context first
+and then generates a grounded answer locally.
 """
     )
 
     st.caption(
-        "RAG  •  Multi-Document Search  •  LangChain  •  "
-        "Ollama  •  Chroma  •  Local AI"
+        "RAG • Multi-Document Search • "
+        "LangChain • Transformers • "
+        "Chroma • Streamlit"
     )
 
 
 # ============================================================
-# 15. PROJECT METRICS
+# 18. METRICS
 # ============================================================
 
-metric1, metric2, metric3, metric4 = st.columns(4)
+metric1, metric2, metric3, metric4 = (
+    st.columns(4)
+)
 
 
 with metric1:
 
     st.metric(
-        label="Documents",
-        value=DOCUMENT_COUNT
+        "Documents",
+        st.session_state.document_count,
     )
 
 
 with metric2:
 
     st.metric(
-        label="Pages",
-        value=f"{PAGE_COUNT:,}"
+        "Pages",
+        f"{st.session_state.page_count:,}",
     )
 
 
 with metric3:
 
     st.metric(
-        label="Knowledge Chunks",
-        value=f"{chunk_count:,}"
+        "Knowledge Chunks",
+        f"{st.session_state.chunk_count:,}",
     )
 
 
 with metric4:
 
     st.metric(
-        label="Retrieved Context",
-        value="Top 4"
+        "Retrieved Context",
+        f"Top {RETRIEVAL_K}",
     )
 
 
 # ============================================================
-# 16. TOPIC EXPLORER — REAL TABS
+# 19. KB STATUS
+# ============================================================
+
+if not st.session_state.knowledge_base_ready:
+
+    st.info(
+        "👈 Upload PDF documents in the sidebar "
+        "and click **Build Knowledge Base**."
+    )
+
+
+# ============================================================
+# 20. TOPIC EXPLORER
 # ============================================================
 
 st.subheader(
@@ -483,7 +940,8 @@ st.subheader(
 )
 
 st.caption(
-    "Switch between topics and ask a suggested question."
+    "Switch between topics or ask "
+    "your own question."
 )
 
 
@@ -494,7 +952,7 @@ topic_tabs = st.tabs(
         "🤖 AI Agents",
         "🔗 Hugging Face",
         "⚙️ Agentic Design",
-        "📚 LLM Applications"
+        "📚 Applications",
     ]
 )
 
@@ -502,55 +960,28 @@ topic_tabs = st.tabs(
 selected_question = None
 
 
-# ============================================================
-# TAB 1 — LARGE LANGUAGE MODELS
-# ============================================================
-
 with topic_tabs[0]:
 
     st.markdown(
         """
 ### 🧠 Large Language Models
 
-Explore how Large Language Models understand text,
-generate responses and power modern AI applications.
+Explore how Large Language Models understand
+and generate language.
 """
     )
 
+    if st.button(
+        "What is a Large Language Model?",
+        key="llm_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
+        selected_question = (
+            "What is a Large Language Model "
+            "and how does it work?"
+        )
 
-
-    with col1:
-
-        if st.button(
-            "What is a Large Language Model?",
-            key="llm_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What is a Large Language Model "
-                "and how does it work?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "How do LLMs generate text?",
-            key="llm_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "How do Large Language Models generate text?"
-            )
-
-
-# ============================================================
-# TAB 2 — PROMPT ENGINEERING
-# ============================================================
 
 with topic_tabs[1]:
 
@@ -558,45 +989,22 @@ with topic_tabs[1]:
         """
 ### ✍️ Prompt Engineering
 
-Learn how instructions and prompts influence AI model
-responses and how prompts can be improved.
+Explore how prompts influence model behaviour
+and response quality.
 """
     )
 
+    if st.button(
+        "What is Prompt Engineering?",
+        key="prompt_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
+        selected_question = (
+            "What is prompt engineering "
+            "and why is it important?"
+        )
 
-
-    with col1:
-
-        if st.button(
-            "What is Prompt Engineering?",
-            key="prompt_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What is prompt engineering "
-                "and why is it important?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "What makes a good prompt?",
-            key="prompt_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What makes an effective prompt?"
-            )
-
-
-# ============================================================
-# TAB 3 — AI AGENTS
-# ============================================================
 
 with topic_tabs[2]:
 
@@ -604,45 +1012,22 @@ with topic_tabs[2]:
         """
 ### 🤖 AI Agents
 
-Explore AI systems that can reason, use tools,
-make decisions and perform multi-step tasks.
+Explore intelligent systems that can reason,
+use tools and perform tasks.
 """
     )
 
+    if st.button(
+        "What are AI Agents?",
+        key="agents_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
+        selected_question = (
+            "What are AI agents and "
+            "how do agentic systems work?"
+        )
 
-
-    with col1:
-
-        if st.button(
-            "What are AI Agents?",
-            key="agent_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What are AI agents and "
-                "how do agentic systems work?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "What can AI Agents do?",
-            key="agent_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What tasks can AI agents perform?"
-            )
-
-
-# ============================================================
-# TAB 4 — HUGGING FACE
-# ============================================================
 
 with topic_tabs[3]:
 
@@ -650,46 +1035,22 @@ with topic_tabs[3]:
         """
 ### 🔗 Hugging Face
 
-Explore pretrained models, Transformers, pipelines
+Explore pretrained models, Transformers
 and the Hugging Face ecosystem.
 """
     )
 
+    if st.button(
+        "What is Hugging Face?",
+        key="hf_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
+        selected_question = (
+            "What is Hugging Face "
+            "and how is it used with LLMs?"
+        )
 
-
-    with col1:
-
-        if st.button(
-            "What is Hugging Face?",
-            key="hf_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What is Hugging Face "
-                "and how is it used with LLMs?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "What are Hugging Face pipelines?",
-            key="hf_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What are Hugging Face pipelines "
-                "and how are they used?"
-            )
-
-
-# ============================================================
-# TAB 5 — AGENTIC DESIGN PATTERNS
-# ============================================================
 
 with topic_tabs[4]:
 
@@ -697,110 +1058,62 @@ with topic_tabs[4]:
         """
 ### ⚙️ Agentic Design Patterns
 
-Explore common patterns for building intelligent
-AI-agent workflows and autonomous systems.
+Explore reusable patterns for building
+AI-agent systems.
 """
     )
 
+    if st.button(
+        "What are Agentic Design Patterns?",
+        key="agentic_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
+        selected_question = (
+            "What are the main "
+            "agentic design patterns?"
+        )
 
-
-    with col1:
-
-        if st.button(
-            "Main Agentic Design Patterns",
-            key="design_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What are the main agentic design patterns?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "How are Agentic Patterns used?",
-            key="design_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "How are agentic design patterns "
-                "used in AI applications?"
-            )
-
-
-# ============================================================
-# TAB 6 — LLM APPLICATIONS
-# ============================================================
 
 with topic_tabs[5]:
 
     st.markdown(
         """
-### 📚 LLM Applications
+### 📚 AI Applications
 
-Explore practical business and technical uses
-of Large Language Models.
+Explore practical AI applications described
+inside your uploaded documents.
 """
     )
 
+    if st.button(
+        "Show common LLM applications",
+        key="applications_question",
+        use_container_width=True,
+    ):
 
-    col1, col2 = st.columns(2)
-
-
-    with col1:
-
-        if st.button(
-            "Common LLM Applications",
-            key="application_question_1",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "What are common real-world applications "
-                "of Large Language Models?"
-            )
-
-
-    with col2:
-
-        if st.button(
-            "How are LLMs used in business?",
-            key="application_question_2",
-            use_container_width=True
-        ):
-
-            selected_question = (
-                "How are Large Language Models "
-                "used in businesses?"
-            )
+        selected_question = (
+            "What are common real-world applications "
+            "of Large Language Models?"
+        )
 
 
 # ============================================================
-# 17. CHAT AREA
+# 21. CHAT
 # ============================================================
 
 st.divider()
 
-
 st.subheader(
-    "💬 Ask the Course Assistant"
+    "💬 Ask the Document Assistant"
 )
-
 
 st.caption(
-    "Answers are generated only from the indexed course documents."
+    "Answers are grounded in the uploaded PDF documents."
 )
 
 
-# ============================================================
-# 18. DISPLAY CHAT HISTORY
-# ============================================================
-
+# Display previous messages.
 for message in st.session_state.messages:
 
     with st.chat_message(
@@ -812,17 +1125,14 @@ for message in st.session_state.messages:
         )
 
 
-# ============================================================
-# 19. USER INPUT
-# ============================================================
-
 typed_question = st.chat_input(
-    "Ask anything about the AI and LLM course materials..."
+    "Ask a question about your uploaded documents...",
+    disabled=(
+        not st.session_state.knowledge_base_ready
+    ),
 )
 
 
-# A manually typed question has priority.
-# Otherwise use the question selected from a topic tab.
 question = (
     typed_question
     if typed_question
@@ -831,217 +1141,183 @@ question = (
 
 
 # ============================================================
-# 20. PROCESS QUESTION
+# 22. PROCESS QUESTION
 # ============================================================
 
 if question:
 
-    # --------------------------------------------------------
-    # DISPLAY USER QUESTION
-    # --------------------------------------------------------
+    if not st.session_state.knowledge_base_ready:
 
-    with st.chat_message(
-        "user"
-    ):
-
-        st.markdown(
-            question
+        st.warning(
+            "Please build the knowledge base first."
         )
 
+    else:
 
-    # Save user question.
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": question
-        }
-    )
+        # Show user question.
+        with st.chat_message("user"):
 
+            st.markdown(question)
 
-    # --------------------------------------------------------
-    # ASSISTANT RESPONSE
-    # --------------------------------------------------------
+        # Store user question.
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
 
-    with st.chat_message(
-        "assistant"
-    ):
-
-        with st.spinner(
-            "Searching the knowledge base..."
+        # Generate assistant response.
+        with st.chat_message(
+            "assistant"
         ):
 
-            # ------------------------------------------------
-            # RETRIEVAL
-            # ------------------------------------------------
+            try:
 
-            retrieved_docs = (
-                retriever.invoke(
-                    question
+                with st.spinner(
+                    "Searching documents and "
+                    "generating the answer..."
+                ):
+
+                    # Configuration B:
+                    # retrieve the top 4 chunks.
+                    retriever = (
+                        st.session_state
+                        .vectorstore
+                        .as_retriever(
+                            search_type="similarity",
+                            search_kwargs={
+                                "k": RETRIEVAL_K,
+                            },
+                        )
+                    )
+
+                    retrieved_docs = (
+                        retriever.invoke(
+                            question
+                        )
+                    )
+
+                    context = format_docs(
+                        retrieved_docs
+                    )
+
+                    answer = generate_answer(
+                        question,
+                        context,
+                    )
+
+                    retrieved_sources = (
+                        get_retrieved_sources(
+                            retrieved_docs
+                        )
+                    )
+
+                # Display clean answer.
+                st.markdown(answer)
+
+                # Display sources from metadata.
+                st.markdown(
+                    "#### 📚 Retrieved Sources"
                 )
-            )
 
+                for source in retrieved_sources:
 
-            # ------------------------------------------------
-            # PREPARE CONTEXT
-            # ------------------------------------------------
+                    st.markdown(
+                        f"- `{source}`"
+                    )
 
-            context = format_docs(
-                retrieved_docs
-            )
+                # Display raw retrieved chunks.
+                with st.expander(
+                    "🔎 View Retrieved Context"
+                ):
 
+                    for index, doc in enumerate(
+                        retrieved_docs,
+                        start=1,
+                    ):
 
-            # ------------------------------------------------
-            # BUILD PROMPT
-            # ------------------------------------------------
+                        filename = (
+                            doc.metadata.get(
+                                "source",
+                                "Unknown document",
+                            )
+                        )
 
-            final_prompt = (
-                prompt.invoke(
+                        page = (
+                            doc.metadata.get(
+                                "page",
+                                0,
+                            )
+                            + 1
+                        )
+
+                        preview = " ".join(
+                            doc.page_content.split()
+                        )
+
+                        st.markdown(
+                            f"**{index}. "
+                            f"{filename} — "
+                            f"Page {page}**"
+                        )
+
+                        st.caption(
+                            preview[:600] + "..."
+                        )
+
+                        st.divider()
+
+                # Save sources with assistant response.
+                source_text = "\n".join(
+                    f"- `{source}`"
+                    for source in retrieved_sources
+                )
+
+                saved_answer = (
+                    answer
+                    + "\n\n"
+                    + "#### 📚 Retrieved Sources\n"
+                    + source_text
+                )
+
+                st.session_state.messages.append(
                     {
-                        "context": context,
-                        "question": question
+                        "role": "assistant",
+                        "content": saved_answer,
                     }
                 )
-            )
 
+            except Exception:
 
-            # ------------------------------------------------
-            # GENERATE ANSWER
-            # ------------------------------------------------
-
-            answer = llm.invoke(
-                final_prompt.to_string()
-            )
-
-
-            # ------------------------------------------------
-            # GET REAL SOURCES
-            # ------------------------------------------------
-
-            retrieved_sources = (
-                get_retrieved_sources(
-                    retrieved_docs
-                )
-            )
-
-
-        # ----------------------------------------------------
-        # DISPLAY ANSWER
-        # ----------------------------------------------------
-
-        st.markdown(
-            answer
-        )
-
-
-        # ----------------------------------------------------
-        # DISPLAY SOURCES
-        # ----------------------------------------------------
-
-        st.markdown(
-            "#### 📚 Retrieved Sources"
-        )
-
-
-        for source in retrieved_sources:
-
-            st.markdown(
-                f"- `{source}`"
-            )
-
-
-        # ----------------------------------------------------
-        # DISPLAY RETRIEVED CONTEXT
-        # ----------------------------------------------------
-
-        with st.expander(
-            "🔎 View Retrieved Context"
-        ):
-
-            for index, doc in enumerate(
-                retrieved_docs,
-                start=1
-            ):
-
-                # Real source filename.
-                filename = Path(
-                    doc.metadata["source"]
-                ).name
-
-
-                # Human-readable page number.
-                page = (
-                    doc.metadata.get(
-                        "page",
-                        0
-                    )
-                    + 1
+                logger.exception(
+                    "Question-answering request failed."
                 )
 
-
-                # Clean the PDF text.
-                preview = " ".join(
-                    doc.page_content.split()
+                st.error(
+                    "The local AI model could not complete "
+                    "this request. Check the application "
+                    "logs for details."
                 )
-
-
-                st.markdown(
-                    f"**{index}. "
-                    f"{filename} — "
-                    f"Page {page}**"
-                )
-
-
-                st.caption(
-                    preview[:600] + "..."
-                )
-
-
-                st.divider()
-
-
-    # ========================================================
-    # 21. SAVE ASSISTANT ANSWER
-    # ========================================================
-
-    source_text = "\n".join(
-        f"- `{source}`"
-        for source in retrieved_sources
-    )
-
-
-    saved_answer = (
-        answer
-        + "\n\n"
-        + "#### 📚 Retrieved Sources\n"
-        + source_text
-    )
-
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": saved_answer
-        }
-    )
 
 
 # ============================================================
-# 22. FOOTER
+# 23. FOOTER
 # ============================================================
 
 st.divider()
 
-
 st.caption(
-    "AI Course Intelligence • Multi-Document RAG System"
+    "AI Course Intelligence • "
+    "Multi-Document RAG System"
 )
-
 
 st.caption(
     "Developed by Ruturaj Mokashi"
 )
 
-
 st.caption(
-    "LangChain • Ollama • Chroma • Streamlit • Local AI"
+    "LangChain • Transformers • "
+    "Chroma • Streamlit • "
+    "Source-Aware Retrieval"
 )
